@@ -36,10 +36,17 @@ pip install crewai ccxt web3 tensorflow pandas sklearn requests python-dotenv lo
 ## .env 
 
 BINANCE_API_KEY=your_binance_key
+
 BINANCE_SECRET=your_binance_secret
+
 BITMEX_API_KEY=your_bitmex_key
+
 BITMEX_SECRET=your_bitmex_secret
+
 OKX_API_KEY=your_okx_key
+
 OKX_SECRET=your_okx_secret
+
 OKX_PASSPHRASE=your_okx_passphrase
+
 GLASSNODE_KEY=your_glassnode_key
