@@ -28,12 +28,12 @@ MEV Protection: Placeholder for Flashbots/private tx (extendable).
 
 Extensible: Modular agents, easy to add new exchanges, features, or reporting.
 
-# Dependencies:
+## Dependencies:
 
 bash
 pip install crewai ccxt web3 tensorflow pandas sklearn requests python-dotenv loguru
 
-# .env 
+## .env 
 
 BINANCE_API_KEY=your_binance_key
 BINANCE_SECRET=your_binance_secret
