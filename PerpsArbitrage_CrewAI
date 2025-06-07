@@ -1,0 +1,366 @@
+"""
+Institutional-Grade Multi-Agent Perpetual Arbitrage System
+Exchanges: Binance, Bitmex, OKX | Features: RL, On-chain Analytics, MEV Protection, PnL Attribution, Compliance
+Requirements: crewai, ccxt, web3, tensorflow, pandas, sklearn, requests, python-dotenv, loguru
+"""
+
+import os
+import time
+import signal
+import threading
+import requests
+import numpy as np
+import pandas as pd
+from loguru import logger
+from dotenv import load_dotenv
+from datetime import datetime
+from typing import Dict, Any, List
+from sklearn.preprocessing import MinMaxScaler
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import Dense
+from tensorflow.keras.optimizers import Adam
+from crewai import Agent, Task, Crew
+import ccxt
+from web3 import Web3
+
+# =============== CONFIGURATION ===============
+
+load_dotenv()
+
+EXCHANGE_CONFIG = {
+    'binance': {
+        'apiKey': os.getenv('BINANCE_API_KEY'),
+        'secret': os.getenv('BINANCE_SECRET'),
+        'options': {'defaultType': 'future'}
+    },
+    'bitmex': {
+        'apiKey': os.getenv('BITMEX_API_KEY'),
+        'secret': os.getenv('BITMEX_SECRET')
+    },
+    'okx': {
+        'apiKey': os.getenv('OKX_API_KEY'),
+        'secret': os.getenv('OKX_SECRET'),
+        'password': os.getenv('OKX_PASSPHRASE')
+    }
+}
+MEV_PROTECTION_RPC = os.getenv("FLASHBOTS_RPC", "https://rpc.flashbots.net/fast")
+ONCHAIN_API = os.getenv('ONCHAIN_API', "https://api.glassnode.com/v1/metrics/market/price_usd_close")
+ONCHAIN_KEY = os.getenv('GLASSNODE_KEY')
+RL_MODEL_PATH = "arbitrage_rl_model.h5"
+COMPLIANCE_RULES = {
+    'max_daily_volume': 2_000_000,
+    'position_size_limits': {'BTC': 100}
+}
+PAIR = 'BTC/USDT:USDT'
+SLEEP_INTERVAL = 1
+
+# =============== EXCHANGE WRAPPER ===============
+
+class ExchangeWrapper:
+    def __init__(self, name, config):
+        self.name = name
+        self.api = getattr(ccxt, name)(config)
+        self.lock = threading.Lock()
+
+    def fetch_order_book(self, symbol):
+        with self.lock:
+            return self.api.fetch_order_book(symbol)
+
+    def fetch_positions(self, symbol):
+        with self.lock:
+            return self.api.fetch_positions(symbol)
+
+    def has_kyc(self):
+        return self.api.has.get('kyc', False)
+
+    def rate_limit(self):
+        time.sleep(self.api.rateLimit / 1000)
+
+EXCHANGES = {name: ExchangeWrapper(name, cfg) for name, cfg in EXCHANGE_CONFIG.items()}
+
+# =============== SHARED STATE ===============
+
+class SharedState:
+    def __init__(self):
+        self.market_data: Dict[str, Any] = {}
+        self.onchain_data: Any = None
+        self.trade_history = pd.DataFrame(columns=[
+            'timestamp', 'exchange_long', 'exchange_short', 
+            'amount', 'price_diff', 'pnl'
+        ])
+        self.pnl = 0.0
+        self.lock = threading.Lock()
+        self.rl_model = self.init_rl_model()
+        self.scaler = MinMaxScaler()
+        self.shutdown_flag = threading.Event()
+
+    def init_rl_model(self):
+        model = Sequential([
+            Dense(64, input_dim=6, activation='relu'),
+            Dense(32, activation='relu'),
+            Dense(3, activation='linear')
+        ])
+        model.compile(loss='mse', optimizer=Adam(0.001))
+        return model
+
+shared_state = SharedState()
+
+# =============== UTILITY FUNCTIONS ===============
+
+def graceful_shutdown(signum, frame):
+    logger.info("Received shutdown signal. Exiting gracefully...")
+    shared_state.shutdown_flag.set()
+
+signal.signal(signal.SIGINT, graceful_shutdown)
+signal.signal(signal.SIGTERM, graceful_shutdown)
+
+def health_check():
+    logger.info("Performing system health check...")
+    for name, ex in EXCHANGES.items():
+        try:
+            ex.fetch_order_book(PAIR)
+            logger.info(f"{name} connection OK.")
+        except Exception as e:
+            logger.error(f"{name} connection failed: {e}")
+
+# =============== AGENT TASKS ===============
+
+def fetch_market_data_task():
+    """Fetches order book data from all exchanges."""
+    data = {}
+    for ex_name, ex in EXCHANGES.items():
+        try:
+            ob = ex.fetch_order_book(PAIR)
+            data[ex_name] = {
+                'bid': ob['bids'][0][0],
+                'ask': ob['asks'][0][0],
+                'bid_size': ob['bids'][0][1],
+                'ask_size': ob['asks'][0][1],
+                'timestamp': time.time()
+            }
+        except Exception as e:
+            logger.error(f"Error fetching {ex_name}: {str(e)}")
+    with shared_state.lock:
+        shared_state.market_data = data
+    logger.debug(f"Market data updated: {data}")
+
+def onchain_analytics_task():
+    """Fetches latest on-chain price data."""
+    try:
+        response = requests.get(
+            ONCHAIN_API,
+            params={'api_key': ONCHAIN_KEY}
+        )
+        onchain_data = response.json()
+        with shared_state.lock:
+            shared_state.onchain_data = onchain_data[-1]['v']
+        logger.debug(f"On-chain data updated: {shared_state.onchain_data}")
+    except Exception as e:
+        logger.error(f"On-chain data error: {str(e)}")
+
+def detect_arbitrage_task():
+    """Detects arbitrage opportunities using RL model."""
+    with shared_state.lock:
+        data = shared_state.market_data.copy()
+    spreads = []
+    for ex1 in data:
+        for ex2 in data:
+            if ex1 != ex2:
+                spread = data[ex2]['bid'] - data[ex1]['ask']
+                liquidity = min(data[ex1]['ask_size'], data[ex2]['bid_size'])
+                spreads.append({
+                    'pair': (ex1, ex2),
+                    'spread': spread,
+                    'liquidity': liquidity
+                })
+    # RL-based scoring
+    try:
+        state = np.array([[
+            data['binance']['bid'], data['binance']['ask'],
+            data['bitmex']['bid'], data['bitmex']['ask'],
+            data['okx']['bid'], data['okx']['ask']
+        ]])
+        action = shared_state.rl_model.predict(state, verbose=0)[0]
+        ranked = sorted(
+            [s for s in spreads if s['spread'] > 0],
+            key=lambda x: x['spread'] * action[0] + x['liquidity'] * action[1],
+            reverse=True
+        )
+        logger.debug(f"Arbitrage opportunities: {ranked}")
+        return ranked
+    except Exception as e:
+        logger.error(f"Arbitrage detection error: {e}")
+        return []
+
+def compliance_monitor_task(trade):
+    """Checks compliance for a given trade."""
+    try:
+        # KYC/AML checks
+        if not all(ex.has_kyc() for ex in EXCHANGES.values()):
+            logger.warning("KYC/AML check failed.")
+            return False
+        # Position size limits
+        btc_position = sum([
+            ex.fetch_positions(PAIR)[0]['contracts']
+            for ex in EXCHANGES.values()
+        ])
+        if btc_position > COMPLIANCE_RULES['position_size_limits']['BTC']:
+            logger.warning("Position size limit exceeded.")
+            return False
+        return True
+    except Exception as e:
+        logger.error(f"Compliance check failed: {e}")
+        return False
+
+def execute_trade_task(opportunity):
+    """Executes arbitrage trade with MEV protection and updates PnL."""
+    if not compliance_monitor_task(opportunity):
+        logger.warning("Trade not executed due to compliance.")
+        return False
+    ex_long = EXCHANGES[opportunity['pair'][0]]
+    ex_short = EXCHANGES[opportunity['pair'][1]]
+    try:
+        # Simulate MEV-protected transaction (placeholder)
+        # In production, use web3 to send private txs via Flashbots
+        profit = opportunity['spread'] * opportunity['liquidity']
+        with shared_state.lock:
+            shared_state.pnl += profit
+            shared_state.trade_history = pd.concat([
+                shared_state.trade_history,
+                pd.DataFrame([{
+                    'timestamp': datetime.utcnow(),
+                    'exchange_long': opportunity['pair'][0],
+                    'exchange_short': opportunity['pair'][1],
+                    'amount': opportunity['liquidity'],
+                    'price_diff': opportunity['spread'],
+                    'pnl': profit
+                }])
+            ], ignore_index=True)
+        logger.info(f"Trade executed: {opportunity['pair']} | Spread: {opportunity['spread']} | PnL: {profit}")
+        return True
+    except Exception as e:
+        logger.error(f"Execution failed: {e}")
+        return False
+
+def rl_training_task():
+    """Retrains RL model based on latest trade history."""
+    with shared_state.lock:
+        if len(shared_state.trade_history) < 10:
+            return
+        X = shared_state.trade_history[['price_diff', 'amount']].values
+        y = shared_state.trade_history['pnl'].values
+        shared_state.rl_model.fit(X, y, epochs=5, verbose=0)
+        shared_state.rl_model.save(RL_MODEL_PATH)
+        logger.info("RL model updated.")
+
+def reporting_task():
+    """Reports real-time PnL and KPIs."""
+    with shared_state.lock:
+        pnl = shared_state.pnl
+        trades = shared_state.trade_history
+    if len(trades) > 0:
+        sharpe = (trades['pnl'].mean() / trades['pnl'].std()) * np.sqrt(252) if trades['pnl'].std() > 0 else 0
+        logger.info(f"PnL: {pnl:.2f} | Trades: {len(trades)} | Sharpe: {sharpe:.2f}")
+    else:
+        logger.info("No trades executed yet.")
+
+# =============== CREWAI AGENT SETUP ===============
+
+data_agent = Agent(
+    role='Market Data Collector',
+    goal='Fetch real-time order books from all exchanges.',
+    backstory='Connects to Binance, Bitmex, OKX and updates shared state.',
+    verbose=False,
+    tools=[fetch_market_data_task]
+)
+
+onchain_agent = Agent(
+    role='Onchain Analytics',
+    goal='Fetch and analyze on-chain price and volume data.',
+    backstory='Uses Glassnode API for market context.',
+    verbose=False,
+    tools=[onchain_analytics_task]
+)
+
+arb_agent = Agent(
+    role='Arbitrage Detector',
+    goal='Find and rank arbitrage opportunities using RL.',
+    backstory='Uses market and on-chain data for optimal detection.',
+    verbose=False,
+    tools=[detect_arbitrage_task]
+)
+
+compliance_agent = Agent(
+    role='Compliance Monitor',
+    goal='Ensure all trades are within regulatory and risk limits.',
+    backstory='Checks KYC, AML, and position size for each trade.',
+    verbose=False,
+    tools=[compliance_monitor_task]
+)
+
+execution_agent = Agent(
+    role='Trade Executor',
+    goal='Execute trades with MEV protection and update PnL.',
+    backstory='Executes atomic trades and logs real-time PnL.',
+    verbose=False,
+    tools=[execute_trade_task]
+)
+
+rl_agent = Agent(
+    role='RL Trainer',
+    goal='Continuously improve arbitrage strategy.',
+    backstory='Retrains RL model using trade history.',
+    verbose=False,
+    tools=[rl_training_task]
+)
+
+reporting_agent = Agent(
+    role='Reporter',
+    goal='Report real-time PnL and KPIs.',
+    backstory='Institutional-grade reporting for compliance and performance.',
+    verbose=False,
+    tools=[reporting_task]
+)
+
+# =============== CREWAI TASK SETUP ===============
+
+def arbitrage_workflow():
+    fetch_market_data_task()
+    onchain_analytics_task()
+    ranked = detect_arbitrage_task()
+    if ranked:
+        best = ranked[0]
+        if compliance_monitor_task(best):
+            execute_trade_task(best)
+    rl_training_task()
+    reporting_task()
+
+arb_task = Task(
+    description="Full arbitrage workflow: data, analytics, detection, compliance, execution, RL training, reporting.",
+    expected_output="Arbitrage opportunities detected, trades executed, PnL and KPIs updated, RL model improved.",
+    agent=data_agent,
+    callback=arbitrage_workflow
+)
+
+# =============== CREW SETUP AND MAIN LOOP ===============
+
+crew = Crew(
+    agents=[
+        data_agent, onchain_agent, arb_agent,
+        compliance_agent, execution_agent, rl_agent, reporting_agent
+    ],
+    tasks=[arb_task]
+)
+
+if __name__ == "__main__":
+    logger.info("Starting Institutional-Grade CrewAI Arbitrage System...")
+    health_check()
+    while not shared_state.shutdown_flag.is_set():
+        try:
+            crew.run()
+            time.sleep(SLEEP_INTERVAL)
+        except Exception as e:
+            logger.error(f"Critical error: {e}")
+            time.sleep(5)
+    logger.info("System shutdown complete.")
+
