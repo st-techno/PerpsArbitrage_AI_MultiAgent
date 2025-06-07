@@ -4,7 +4,7 @@
 
 Perps Arbitrage using AI MultiAgent CrewAI Framework on Binance, BitMEX and OKX
 
-Production-Grade Features
+# Production-Grade Features
 
 Logging: Uses loguru for granular, structured logs.
 
@@ -28,15 +28,13 @@ MEV Protection: Placeholder for Flashbots/private tx (extendable).
 
 Extensible: Modular agents, easy to add new exchanges, features, or reporting.
 
-Dependencies:
+# Dependencies:
 
 bash
 pip install crewai ccxt web3 tensorflow pandas sklearn requests python-dotenv loguru
-.env 
 
-Example:
+# .env 
 
-text
 BINANCE_API_KEY=your_binance_key
 BINANCE_SECRET=your_binance_secret
 BITMEX_API_KEY=your_bitmex_key
