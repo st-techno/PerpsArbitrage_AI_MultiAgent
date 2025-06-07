@@ -1,10 +1,10 @@
-## Copyright @ ST Technologies
+# Copyright @ ST Technologies
 
-# PerpsArbitrage_AI_MultiAgent
+## PerpsArbitrage_AI_MultiAgent
 
 Perps Arbitrage using AI MultiAgent CrewAI Framework on Binance, BitMEX and OKX
 
-# Production-Grade Features
+## Production-Grade Features
 
 Logging: Uses loguru for granular, structured logs.
 
